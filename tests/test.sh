@@ -140,5 +140,62 @@ assert_true "Trojan tag is managed" protocol_exists "$TAG_TROJAN"
 assert_true "remove menu contains Trojan and Snell" grep -q '6) Trojan TLS' "$PROJECT_DIR/OU-SB.sh"
 assert_true "remove menu keeps Snell at option 7" grep -q '7) Snell' "$PROJECT_DIR/OU-SB.sh"
 
+# 1. 内存检测与 Go runtime 内存限额测试
+mem_detected=$(detect_memory_mb)
+assert_true "detect_memory_mb returns positive integer" test "$mem_detected" -gt 0
+
+# Mock memory function to test tiered limits
+detect_memory_mb() { echo 128; }
+assert_eq "tier 128M limit" "70MiB 30" "$(get_sing_box_mem_limits)"
+detect_memory_mb() { echo 256; }
+assert_eq "tier 256M limit" "150MiB 50" "$(get_sing_box_mem_limits)"
+detect_memory_mb() { echo 512; }
+assert_eq "tier 512M limit" "320MiB 60" "$(get_sing_box_mem_limits)"
+detect_memory_mb() { echo 1024; }
+assert_eq "tier 1024M limit" "700MiB 80" "$(get_sing_box_mem_limits)"
+detect_memory_mb() { echo 2048; }
+assert_eq "tier >1024M has no hard limits" " " "$(get_sing_box_mem_limits)"
+unset -f detect_memory_mb
+
+# 2. setup_services (systemd) 加固测试
+INIT_SYSTEM="systemd"
+detect_memory_mb() { echo 256; }
+setup_services
+assert_true "systemd service has Restart=always" grep -q "Restart=always" "$SYSTEMD_DIR/sing-box.service"
+assert_true "systemd service has StartLimitIntervalSec=0" grep -q "StartLimitIntervalSec=0" "$SYSTEMD_DIR/sing-box.service"
+assert_true "systemd service has RestartSec=3s" grep -q "RestartSec=3s" "$SYSTEMD_DIR/sing-box.service"
+assert_true "systemd service has OOMScoreAdjust=-500" grep -q "OOMScoreAdjust=-500" "$SYSTEMD_DIR/sing-box.service"
+assert_true "systemd service sets GOMEMLIMIT on low ram" grep -q "Environment=\"GOMEMLIMIT=150MiB\"" "$SYSTEMD_DIR/sing-box.service"
+assert_true "systemd watchdog timer created" grep -q "OnUnitActiveSec=1m" "$SYSTEMD_DIR/ou-sb-watchdog.timer"
+unset -f detect_memory_mb
+
+# 3. setup_services (openrc) 加固测试
+INIT_SYSTEM="openrc"
+detect_memory_mb() { echo 128; }
+setup_services
+assert_true "openrc service uses supervise-daemon" grep -q 'supervisor="supervise-daemon"' "$OPENRC_DIR/sing-box"
+assert_true "openrc service sets respawn delay" grep -q 'respawn_delay=3' "$OPENRC_DIR/sing-box"
+assert_true "openrc service exports GOMEMLIMIT" grep -q 'export GOMEMLIMIT="70MiB"' "$OPENRC_DIR/sing-box"
+unset -f detect_memory_mb
+
+# 4. run_watchdog 自动回滚与自愈测试
+# 先创建一个有效备份
+valid_backup=$(backup_config)
+# 故意破坏当前配置文件
+echo '{ invalid json syntax' > "$CONFIG_PATH"
+assert_false "config is broken" validate_candidate "$CONFIG_PATH"
+# 触发 watchdog 自愈
+export OU_SB_TEST_WATCHDOG_DEAD=1
+assert_true "run_watchdog recovers from backup" run_watchdog
+assert_true "config is restored and valid" validate_candidate "$CONFIG_PATH"
+assert_true "watchdog log records recovery" grep -q "已成功从有效备份" "$WATCHDOG_LOG"
+unset OU_SB_TEST_WATCHDOG_DEAD
+
+# 5. uninstall_watchdog 清理测试
+INIT_SYSTEM="systemd"
+uninstall_watchdog
+assert_false "watchdog service removed" test -f "$SYSTEMD_DIR/ou-sb-watchdog.service"
+assert_false "watchdog timer removed" test -f "$SYSTEMD_DIR/ou-sb-watchdog.timer"
+
 printf '\n%d passed, %d failed\n' "$passes" "$failures"
 ((failures == 0))

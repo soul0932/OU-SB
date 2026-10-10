@@ -1,5 +1,21 @@
 # Changelog
 
+## V2.0.1 - 2026-10-10
+
+### Added
+- **NAT 小鸡高可用加固**：
+  - Systemd 服务配置 `Restart=always`、`StartLimitIntervalSec=0` 与 `OOMScoreAdjust=-500`，彻底关闭崩溃限流，服务死掉后无条件自动重启。
+  - OpenRC 服务配置 `supervisor="supervise-daemon"` 与 `respawn_delay=3`，解决 Alpine Linux 下服务挂掉无法自愈的缺陷。
+  - 针对 NAT 超低内存小鸡（<=512MB）阶梯化动态注入 Go 内存控制（`GOMEMLIMIT` 与 `GOGC`），防止内存膨胀触发 OOM Killer 强杀。
+  - 增加双重看门狗（Systemd Timer + Cron 联动）每分钟健康巡检；支持进程崩溃自愈、孤立僵死进程清理、损坏配置从备份自动回滚与自愈日志记录。
+- **CLI 与管理面板**：
+  - 管理面板顶部实时展示服务运行状态与保活看门狗激活状态。
+  - 新增管理菜单选项 `11) 保活看门狗管理（自动拉起/自愈日志）`。
+  - 新增命令行选项 `sb --watchdog` 与 `sb --watchdog-log`。
+  - `sb --doctor` 新增内存阶梯检测与看门狗健康诊断。
+- **测试套件扩展**：
+  - 单元测试覆盖低内存分级限额、Systemd/OpenRC 模板生成、看门狗损坏配置自愈回滚与任务卸载。
+
 ## V2.0.0 - 2026-10-08
 
 - 重新定位为 SSH 一键安装和运维版本。

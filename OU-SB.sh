@@ -4,7 +4,7 @@ set -Eeuo pipefail
 APP_NAME="OU-SB"
 APP_VERSION="2.0.0"
 AUTHOR="nodeseek @cshaizhihao"
-RAW_SCRIPT_URL="https://raw.githubusercontent.com/cshaizhihao/OU-SB/main/OU-SB.sh"
+RAW_SCRIPT_URL="${OU_SB_RAW_URL:-https://raw.githubusercontent.com/soul0932/OU-SB/main/OU-SB.sh}"
 
 OU_SB_ROOT="${OU_SB_ROOT:-}"
 APP_DIR="${OU_SB_APP_DIR:-${OU_SB_ROOT}/etc/ou-sb}"
@@ -20,6 +20,9 @@ COMMAND_PATH="${OU_SB_COMMAND_PATH:-${OU_SB_ROOT}/usr/local/bin/sb}"
 SYSTEMD_DIR="${OU_SB_SYSTEMD_DIR:-${OU_SB_ROOT}/etc/systemd/system}"
 OPENRC_DIR="${OU_SB_OPENRC_DIR:-${OU_SB_ROOT}/etc/init.d}"
 SERVICE_NAME="sing-box"
+WATCHDOG_LOG="${OU_SB_WATCHDOG_LOG:-$APP_DIR/watchdog.log}"
+WATCHDOG_LOCK="${OU_SB_WATCHDOG_LOCK:-$APP_DIR/watchdog.lock}"
+CRON_FILE="${OU_SB_CRON_FILE:-${OU_SB_ROOT}/etc/cron.d/ou-sb-watchdog}"
 
 TAG_SS="ou-sb-ss"
 TAG_HY2="ou-sb-hy2"
@@ -240,24 +243,129 @@ validate_candidate() {
     sing-box check -c "$candidate" >/dev/null 2>&1
 }
 
+detect_memory_mb() {
+    local mb=""
+    if [[ -r /proc/meminfo ]]; then
+        mb=$(awk '/MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || true)
+    fi
+    if [[ -z $mb || $mb -le 0 ]]; then
+        mb=$(sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024)}' || true)
+    fi
+    echo "${mb:-1024}"
+}
+
+get_sing_box_mem_limits() {
+    local mem_total
+    mem_total=$(detect_memory_mb)
+    local gomemlimit="" gogc=""
+    if ((mem_total <= 128)); then
+        gomemlimit="70MiB"
+        gogc="30"
+    elif ((mem_total <= 256)); then
+        gomemlimit="150MiB"
+        gogc="50"
+    elif ((mem_total <= 512)); then
+        gomemlimit="320MiB"
+        gogc="60"
+    elif ((mem_total <= 1024)); then
+        gomemlimit="700MiB"
+        gogc="80"
+    fi
+    printf '%s %s' "$gomemlimit" "$gogc"
+}
+
+sing_box_pid() {
+    local pid=""
+    if command -v pidof >/dev/null 2>&1; then
+        pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
+    fi
+    if [[ -z $pid ]] && command -v pgrep >/dev/null 2>&1; then
+        pid=$(pgrep -f "sing-box run" 2>/dev/null | head -n1)
+    fi
+    echo "$pid"
+}
+
+is_sing_box_process_running() {
+    local pid
+    pid=$(sing_box_pid)
+    [[ -n $pid ]]
+}
+
+kill_sing_box_process() {
+    if command -v killall >/dev/null 2>&1; then
+        killall -9 sing-box 2>/dev/null || true
+    fi
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -9 -f "sing-box run" 2>/dev/null || true
+    fi
+}
+
+service_is_active() {
+    [[ "${OU_SB_TESTING:-0}" == "1" ]] && return "${OU_SB_TEST_SERVICE_ACTIVE:-0}"
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null ;;
+        openrc) rc-service "$SERVICE_NAME" status >/dev/null 2>&1 ;;
+        *) is_sing_box_process_running ;;
+    esac
+}
+
+get_service_status_text() {
+    local pid=""
+    pid=$(sing_box_pid)
+    if service_is_active || [[ -n $pid ]]; then
+        printf '%s● 运行中%s%s' "$C_GREEN" "$C_RESET" "${pid:+ (PID: $pid)}"
+    else
+        printf '%s● 未运行 / 已停止%s' "$C_RED" "$C_RESET"
+    fi
+}
+
+get_watchdog_status_text() {
+    local active=0
+    if [[ $INIT_SYSTEM == systemd ]]; then
+        systemctl is-active --quiet ou-sb-watchdog.timer 2>/dev/null && active=1
+    fi
+    if [[ -f "$CRON_FILE" ]] && grep -q -- "--watchdog" "$CRON_FILE" 2>/dev/null; then
+        active=1
+    fi
+    if [[ -f /etc/crontabs/root ]] && grep -q -- "--watchdog" /etc/crontabs/root 2>/dev/null; then
+        active=1
+    fi
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q -- "--watchdog"; then
+        active=1
+    fi
+    if ((active == 1)); then
+        printf '%s● 已激活 (1分钟自愈巡检)%s' "$C_GREEN" "$C_RESET"
+    else
+        printf '%s○ 未激活%s' "$C_YELLOW" "$C_RESET"
+    fi
+}
+
 service_restart() {
     [[ "${OU_SB_TESTING:-0}" == "1" ]] && return 0
     case "$INIT_SYSTEM" in
-        systemd) systemctl restart "$SERVICE_NAME" ;;
+        systemd)
+            systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
+            systemctl restart "$SERVICE_NAME"
+            ;;
         openrc) rc-service "$SERVICE_NAME" restart ;;
         *) return 1 ;;
     esac
 }
 
 service_start() {
+    [[ "${OU_SB_TESTING:-0}" == "1" ]] && return 0
     case "$INIT_SYSTEM" in
-        systemd) systemctl start "$SERVICE_NAME" ;;
+        systemd)
+            systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
+            systemctl start "$SERVICE_NAME"
+            ;;
         openrc) rc-service "$SERVICE_NAME" start ;;
         *) return 1 ;;
     esac
 }
 
 service_stop() {
+    [[ "${OU_SB_TESTING:-0}" == "1" ]] && return 0
     case "$INIT_SYSTEM" in
         systemd) systemctl stop "$SERVICE_NAME" ;;
         openrc) rc-service "$SERVICE_NAME" stop ;;
@@ -1212,8 +1320,16 @@ install_sing_box() {
 }
 
 setup_services() {
-    local sb_bin
-    sb_bin=$(command -v sing-box)
+    local sb_bin mem_limits gomemlimit gogc env_lines=""
+    sb_bin=$(command -v sing-box 2>/dev/null || echo "${OU_SB_SING_BOX_BIN:-/usr/local/bin/sing-box}")
+    read -r gomemlimit gogc <<< "$(get_sing_box_mem_limits)"
+    if [[ -n $gomemlimit ]]; then
+        env_lines="Environment=\"GOMEMLIMIT=$gomemlimit\""$'\n'
+    fi
+    if [[ -n $gogc ]]; then
+        env_lines="${env_lines}Environment=\"GOGC=$gogc\""$'\n'
+    fi
+
     if [[ $INIT_SYSTEM == systemd ]]; then
         mkdir -p "$SYSTEMD_DIR"
         cat > "$SYSTEMD_DIR/sing-box.service" <<EOF
@@ -1221,15 +1337,19 @@ setup_services() {
 Description=sing-box service managed by OU-SB
 After=network-online.target ou-sb-firewall.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=$sb_bin run -c $CONFIG_PATH
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=infinity
-
-[Install]
+Restart=always
+RestartSec=3s
+StartLimitIntervalSec=0
+LimitNOFILE=1048576
+LimitNPROC=512
+OOMScoreAdjust=-500
+TimeoutStopSec=10s
+${env_lines}[Install]
 WantedBy=multi-user.target
 EOF
         cat > "$SYSTEMD_DIR/ou-sb-firewall.service" <<EOF
@@ -1246,19 +1366,56 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable sing-box ou-sb-firewall >/dev/null
+        if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
+            systemctl daemon-reload
+            systemctl enable sing-box ou-sb-firewall >/dev/null 2>&1 || true
+        fi
     elif [[ $INIT_SYSTEM == openrc ]]; then
+        mkdir -p "$OPENRC_DIR"
+        local openrc_env=""
+        [[ -n $gomemlimit ]] && openrc_env="export GOMEMLIMIT=\"$gomemlimit\""$'\n'
+        [[ -n $gogc ]] && openrc_env="${openrc_env}export GOGC=\"$gogc\""$'\n'
+
         cat > "$OPENRC_DIR/sing-box" <<EOF
 #!/sbin/openrc-run
 name="sing-box"
+description="sing-box service managed by OU-SB"
+supervisor="supervise-daemon"
+supervise_daemon_args="--respawn-delay-step 2 --respawn-delay-cap 30 --oom-score-adj -900"
+respawn_delay=3
+respawn_max=0
+respawn_period=1800
 command="$sb_bin"
 command_args="run -c $CONFIG_PATH"
-command_background="yes"
+command_user="root"
 pidfile="/run/sing-box.pid"
 output_log="/var/log/sing-box.log"
 error_log="/var/log/sing-box.log"
 depend() { need net; after ou-sb-firewall; }
+start_pre() {
+${openrc_env}    mkdir -p /run /var/log
+    [ -f "/var/log/sing-box.log" ] || : > "/var/log/sing-box.log"
+    if [ ! -s "$CONFIG_PATH" ]; then
+        eerror "sing-box: config not found or empty: $CONFIG_PATH"
+        return 1
+    fi
+    if ! "\$command" check -c "$CONFIG_PATH" >/dev/null 2>&1; then
+        eerror "sing-box: config is invalid, refusing to start: $CONFIG_PATH"
+        "\$command" check -c "$CONFIG_PATH" 2>&1 | while read -r line; do
+            eerror "sing-box:   \$line"
+        done
+        return 1
+    fi
+    if [ -f "/var/log/sing-box.log" ]; then
+        _size=\$(wc -c < "/var/log/sing-box.log" 2>/dev/null || echo 0)
+        if [ "\$_size" -gt 20971520 ]; then
+            mv -f "/var/log/sing-box.log" "/var/log/sing-box.log.1"
+            : > "/var/log/sing-box.log"
+            ewarn "sing-box: log exceeded 20 MiB, rotated to /var/log/sing-box.log.1"
+        fi
+    fi
+    return 0
+}
 EOF
         cat > "$OPENRC_DIR/ou-sb-firewall" <<EOF
 #!/sbin/openrc-run
@@ -1267,11 +1424,253 @@ start() { $COMMAND_PATH --apply-firewall; }
 stop() { $COMMAND_PATH --clear-firewall; }
 EOF
         chmod +x "$OPENRC_DIR/sing-box" "$OPENRC_DIR/ou-sb-firewall"
-        rc-update add ou-sb-firewall default >/dev/null 2>&1 || true
-        rc-update add sing-box default >/dev/null 2>&1 || true
+        if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
+            rc-update add ou-sb-firewall default >/dev/null 2>&1 || true
+            rc-update add sing-box default >/dev/null 2>&1 || true
+        fi
     else
         die "仅支持 systemd 或 OpenRC"
     fi
+    install_watchdog
+}
+
+install_watchdog() {
+    mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
+
+    # 1. systemd 原生定时器与服务
+    if [[ $INIT_SYSTEM == systemd ]]; then
+        mkdir -p "$SYSTEMD_DIR"
+        cat > "$SYSTEMD_DIR/ou-sb-watchdog.service" <<EOF
+[Unit]
+Description=OU-SB Keepalive Watchdog
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$COMMAND_PATH --watchdog
+EOF
+        cat > "$SYSTEMD_DIR/ou-sb-watchdog.timer" <<EOF
+[Unit]
+Description=Run OU-SB Keepalive Watchdog every minute
+PartOf=ou-sb-watchdog.service
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=1m
+Unit=ou-sb-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+        if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl enable --now ou-sb-watchdog.timer >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # 2. cron 定时任务双重保活
+    local cron_dir
+    cron_dir="$(dirname "$CRON_FILE")"
+    if [[ -d "$cron_dir" ]]; then
+        cat > "$CRON_FILE" <<EOF
+# OU-SB Keepalive Watchdog: every minute health-check and auto-recover sing-box
+* * * * * root $COMMAND_PATH --watchdog >/dev/null 2>&1
+EOF
+        chmod 644 "$CRON_FILE" 2>/dev/null || true
+    elif [[ -f /etc/crontabs/root ]] || command -v crontab >/dev/null 2>&1; then
+        if [[ -d /etc/crontabs ]]; then
+            touch /etc/crontabs/root
+            if ! grep -q -- "$COMMAND_PATH --watchdog" /etc/crontabs/root 2>/dev/null; then
+                printf '* * * * * %s --watchdog >/dev/null 2>&1\n' "$COMMAND_PATH" >> /etc/crontabs/root
+            fi
+            if [[ "${OU_SB_TESTING:-0}" != "1" ]] && command -v rc-service >/dev/null 2>&1; then
+                rc-update add crond default >/dev/null 2>&1 || true
+                rc-service crond start >/dev/null 2>&1 || true
+            fi
+        elif [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
+            (crontab -l 2>/dev/null | grep -v -- "$COMMAND_PATH --watchdog" || true; echo "* * * * * $COMMAND_PATH --watchdog >/dev/null 2>&1") | crontab - 2>/dev/null || true
+        fi
+    fi
+}
+
+uninstall_watchdog() {
+    if [[ $INIT_SYSTEM == systemd ]]; then
+        if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
+            systemctl disable --now ou-sb-watchdog.timer >/dev/null 2>&1 || true
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        rm -f "$SYSTEMD_DIR/ou-sb-watchdog.service" "$SYSTEMD_DIR/ou-sb-watchdog.timer"
+    fi
+    rm -f "$CRON_FILE"
+    if [[ -f /etc/crontabs/root ]]; then
+        sed -i "\|$COMMAND_PATH --watchdog|d" /etc/crontabs/root 2>/dev/null || true
+    fi
+    if [[ "${OU_SB_TESTING:-0}" != "1" ]] && command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null | grep -v -- "$COMMAND_PATH --watchdog" || true) | crontab - 2>/dev/null || true
+    fi
+}
+
+log_watchdog() {
+    local msg=$1
+    mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >> "$WATCHDOG_LOG" 2>/dev/null || true
+    if [[ -f "$WATCHDOG_LOG" ]]; then
+        local line_count
+        line_count=$(wc -l < "$WATCHDOG_LOG" 2>/dev/null || echo 0)
+        if ((line_count > 500)); then
+            local tmp_log
+            tmp_log=$(mktemp "$APP_DIR/watchdog.XXXXXX" 2>/dev/null || mktemp /tmp/watchdog.XXXXXX)
+            tail -n 200 "$WATCHDOG_LOG" > "$tmp_log" 2>/dev/null && mv -f "$tmp_log" "$WATCHDOG_LOG"
+        fi
+    fi
+}
+
+run_watchdog() {
+    mkdir -p "$(dirname "$WATCHDOG_LOCK")" 2>/dev/null || true
+    exec 8>"$WATCHDOG_LOCK" 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1; then
+        flock -n 8 2>/dev/null || return 0
+    fi
+
+    # 未安装则不处理
+    if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
+        command -v sing-box >/dev/null 2>&1 || return 0
+    fi
+
+    # 1. 检查配置损坏情况：若配置文件损坏或为空，但存在有效备份，则先行回滚恢复
+    if ! validate_candidate "$CONFIG_PATH"; then
+        log_watchdog "[ALERT] 当前配置文件校验失败，尝试从最近备份中寻找有效配置恢复..."
+        local restored=1 b
+        for b in $(ls -t "$BACKUP_DIR"/config[-.]*.json 2>/dev/null || true); do
+            if validate_candidate "$b"; then
+                cp -f "$b" "$CONFIG_PATH"
+                chmod 600 "$CONFIG_PATH"
+                log_watchdog "[OK] 已成功从有效备份 $(basename "$b") 恢复配置"
+                restored=0
+                break
+            fi
+        done
+        if ((restored != 0)); then
+            log_watchdog "[ERR] 未找到任何有效配置备份，自愈终止"
+            return 1
+        fi
+    fi
+
+    # 2. 如果配置正常但没有任何入站协议，则不需要运行服务
+    local inbound_count
+    inbound_count=$(jq '.inbounds | length' "$CONFIG_PATH" 2>/dev/null || echo 0)
+    ((inbound_count > 0)) || return 0
+
+    local is_active=1 has_process=1
+    if service_is_active; then is_active=0; fi
+    if pgrep -x sing-box >/dev/null 2>&1; then has_process=0; fi
+    if [[ "${OU_SB_TESTING:-0}" == "1" && "${OU_SB_TEST_WATCHDOG_DEAD:-0}" != "1" ]]; then
+        is_active=0; has_process=0
+    fi
+
+    # 健康且正常运行
+    if ((is_active == 0 && has_process == 0)); then
+        return 0
+    fi
+
+    log_watchdog "[WARN] 检测到 sing-box 异常 (active=$is_active, process=$has_process)，启动自愈恢复..."
+
+    # 2. 清理可能卡死端口的僵尸孤立进程
+    if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
+        if ((is_active != 0 && has_process == 0)); then
+            log_watchdog "[INFO] 检测到服务停止但进程仍在，清理残留进程以释放端口..."
+            pkill -9 -x sing-box 2>/dev/null || true
+            sleep 1
+        fi
+        apply_hy2_firewall >/dev/null 2>&1 || true
+    fi
+
+    # 3. 通过服务管理器拉起
+    if [[ "$INIT_SYSTEM" == "systemd" && "${OU_SB_TESTING:-0}" != "1" ]]; then
+        systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+
+    if service_restart >/dev/null 2>&1 || service_start >/dev/null 2>&1; then
+        [[ "${OU_SB_TESTING:-0}" != "1" ]] && sleep 1
+        if service_is_active || pgrep -x sing-box >/dev/null 2>&1 || [[ "${OU_SB_TESTING:-0}" == "1" ]]; then
+            log_watchdog "[OK] 自愈成功：sing-box 服务已成功拉起并恢复运行"
+            return 0
+        fi
+    fi
+
+    # 4. 紧急兜底：直接后台拉起
+    if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
+        log_watchdog "[WARN] 服务管理器拉起未能就绪，尝试应急后台直接拉起 sing-box..."
+        local sb_bin gomemlimit gogc
+        sb_bin=$(command -v sing-box 2>/dev/null || echo "${OU_SB_SING_BOX_BIN:-/usr/local/bin/sing-box}")
+        read -r gomemlimit gogc <<< "$(get_sing_box_mem_limits)"
+        [[ -n $gomemlimit ]] && export GOMEMLIMIT="$gomemlimit"
+        [[ -n $gogc ]] && export GOGC="$gogc"
+        nohup "$sb_bin" run -c "$CONFIG_PATH" >> /var/log/sing-box.log 2>&1 &
+        sleep 1
+        if pgrep -x sing-box >/dev/null 2>&1; then
+            log_watchdog "[OK] 应急拉起成功：sing-box 进程已恢复"
+            return 0
+        fi
+    fi
+
+    log_watchdog "[ERR] 自愈拉起失败，请使用 sb --doctor 检查错误详情"
+    return 1
+}
+
+show_watchdog_log() {
+    printf '%s=== 保活看门狗自愈日志（最近 50 条）===%s\n' "$C_CYAN" "$C_RESET"
+    if [[ -s "$WATCHDOG_LOG" ]]; then
+        tail -n 50 "$WATCHDOG_LOG"
+    else
+        printf '暂无自愈日志（未发生异常拉起事件）\n'
+    fi
+}
+
+watchdog_menu() {
+    local choice
+    while true; do
+        banner
+        printf '%s保活看门狗与自愈管理%s\n\n' "$C_CYAN" "$C_RESET"
+        printf '  当前服务状态：%s\n' "$(get_service_status_text)"
+        printf '  看门狗巡检  ：%s\n' "$(get_watchdog_status_text)"
+        printf '  自愈日志文件：%s\n\n' "$WATCHDOG_LOG"
+        cat <<'EOF'
+1) 立即执行健康巡检与自愈测试
+2) 查看最近自愈巡检日志
+3) 重新安装并启用保活看门狗
+4) 停止并卸载保活看门狗
+0) 返回主菜单
+EOF
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1)
+                info "正在执行健康巡检..."
+                if run_watchdog; then
+                    ok "巡检完成，服务状态良好"
+                else
+                    warn "巡检执行完毕，请检查日志"
+                fi
+                pause_screen
+                ;;
+            2)
+                show_watchdog_log
+                pause_screen
+                ;;
+            3)
+                install_watchdog
+                ok "保活看门狗已重新安装并启用"
+                pause_screen
+                ;;
+            4)
+                uninstall_watchdog
+                ok "保活看门狗已停止并移除"
+                pause_screen
+                ;;
+            0) return 0 ;;
+            *) warn "无效选项"; sleep 1 ;;
+        esac
+    done
 }
 
 install_self() {
@@ -1324,6 +1723,7 @@ uninstall_ou_sb() {
     count=$(jq '.inbounds | length' "$CONFIG_PATH")
     if ((count == 0)); then
         service_stop || true
+        uninstall_watchdog || true
         if [[ $INIT_SYSTEM == systemd ]]; then
             systemctl disable sing-box ou-sb-firewall >/dev/null 2>&1 || true
             rm -f "$SYSTEMD_DIR/sing-box.service" "$SYSTEMD_DIR/ou-sb-firewall.service"
@@ -1334,7 +1734,7 @@ uninstall_ou_sb() {
             rm -f "$OPENRC_DIR/sing-box" "$OPENRC_DIR/ou-sb-firewall"
         fi
     fi
-    rm -f "$COMMAND_PATH"
+    rm -f "$COMMAND_PATH" "$WATCHDOG_LOG" "$WATCHDOG_LOCK" "$CRON_FILE"
     rm -rf "$APP_DIR" "$INSTALL_DIR"
     if [[ $remove_sb =~ ^[Yy]$ ]]; then
         sb_binary=$(command -v sing-box 2>/dev/null || true)
@@ -1432,6 +1832,9 @@ main_menu() {
     local choice
     while true; do
         banner
+        printf '  %s服务状态%s：%s  |  %s保活看门狗%s：%s\n\n' \
+            "$C_BOLD" "$C_RESET" "$(get_service_status_text)" \
+            "$C_BOLD" "$C_RESET" "$(get_watchdog_status_text)"
         show_protocol_status
         printf '%s快捷按键：sb%s（随时输入 sb 可重新打开管理面板）\n' "$C_CYAN" "$C_RESET"
         printf '\n%s%s操作菜单%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
@@ -1445,9 +1848,10 @@ main_menu() {
         printf '  %s8)%s 停止服务\n' "$C_GREEN" "$C_RESET"
         printf '  %s9)%s 重启服务\n' "$C_GREEN" "$C_RESET"
         printf '  %s10)%s BBR+FQ 与 TCP 调优\n' "$C_GREEN" "$C_RESET"
-        printf '  %s11)%s 更新 sing-box\n' "$C_GREEN" "$C_RESET"
-        printf '  %s12)%s 更新 OU-SB\n' "$C_GREEN" "$C_RESET"
-        printf '  %s13)%s 卸载 OU-SB\n' "$C_GREEN" "$C_RESET"
+        printf '  %s11)%s 保活看门狗管理（自动拉起/自愈日志）\n' "$C_GREEN" "$C_RESET"
+        printf '  %s12)%s 更新 sing-box\n' "$C_GREEN" "$C_RESET"
+        printf '  %s13)%s 更新 OU-SB\n' "$C_GREEN" "$C_RESET"
+        printf '  %s14)%s 卸载 OU-SB\n' "$C_GREEN" "$C_RESET"
         printf '  %s0)%s 退出\n' "$C_RED" "$C_RESET"
         printf '\n'
         read -r -p "请选择: " choice
@@ -1458,8 +1862,9 @@ main_menu() {
             7) if service_start; then ok "服务已启动"; else warn "服务启动失败"; fi; pause_screen ;;
             8) if service_stop; then ok "服务已停止"; else warn "服务停止失败"; fi; pause_screen ;;
             9) if service_restart; then ok "服务已重启"; else warn "服务重启失败"; fi; pause_screen ;;
-            10) network_tuning_menu; pause_screen ;; 11) update_sing_box; pause_screen ;;
-            12) update_ou_sb; pause_screen ;; 13) uninstall_ou_sb ;; 0) exit 0 ;;
+            10) network_tuning_menu; pause_screen ;; 11) watchdog_menu ;;
+            12) update_sing_box; pause_screen ;; 13) update_ou_sb; pause_screen ;;
+            14) uninstall_ou_sb ;; 0) exit 0 ;;
             *) warn "⚠️ 无效选项"; sleep 1 ;;
         esac
     done
@@ -1503,6 +1908,8 @@ first_run() {
 cli_status() {
     printf '%s %s\n' "$APP_NAME" "$APP_VERSION"
     printf 'OS: %s | init: %s\n' "$OS_FAMILY" "$INIT_SYSTEM"
+    printf '服务状态: %s\n' "$(get_service_status_text)"
+    printf '保活看门狗: %s\n' "$(get_watchdog_status_text)"
     if command -v sing-box >/dev/null 2>&1; then
         printf 'sing-box: %s\n' "$(sing-box version 2>/dev/null | head -n1)"
     else
@@ -1540,6 +1947,23 @@ doctor() {
     fi
     ok "基础依赖完整"
     cli_validate
+    info "检测系统内存与小鸡保护机制..."
+    local mem_total
+    mem_total=$(detect_memory_mb)
+    info "检测到系统物理内存: ${mem_total} MB"
+    local gomemlimit gogc
+    read -r gomemlimit gogc <<< "$(get_sing_box_mem_limits)"
+    if [[ -n $gomemlimit ]]; then
+        ok "NAT 低内存保护已生效: GOMEMLIMIT=${gomemlimit}, GOGC=${gogc}"
+    else
+        info "内存较充裕 (>512MB)，使用标准垃圾回收"
+    fi
+    if service_is_active; then
+        ok "sing-box 服务正在运行"
+    else
+        warn "sing-box 服务未处于运行状态"
+    fi
+    ok "保活看门狗配置状态: $(get_watchdog_status_text)"
 }
 
 usage() {
@@ -1549,11 +1973,13 @@ $APP_NAME $APP_VERSION
   sb                     打开管理面板
   sb --apply-firewall    恢复 OU-SB 的 HY2 跳跃规则
   sb --clear-firewall    清理 OU-SB 的 HY2 跳跃规则
+  sb --watchdog          执行保活看门狗健康巡检与自愈
+  sb --watchdog-log      查看保活看门狗自愈日志
   sb --status            查看系统、服务和协议状态
   sb --validate          校验配置和状态文件
   sb --backup            创建配置备份
-  sb --export             输出客户端连接信息
-  sb --doctor             检查依赖和配置
+  sb --export            输出客户端连接信息
+  sb --doctor            检查依赖、服务保活和配置
   sb --version           显示版本
 EOF
 }
@@ -1570,6 +1996,10 @@ main() {
     case "${1:-}" in
         --apply-firewall) apply_hy2_firewall; exit $? ;;
         --clear-firewall) clear_hy2_firewall; exit $? ;;
+        --watchdog) run_watchdog; exit $? ;;
+        --watchdog-log) show_watchdog_log; exit $? ;;
+        --install-watchdog) install_watchdog; exit $? ;;
+        --remove-watchdog) uninstall_watchdog; exit $? ;;
         --status) cli_status; exit $? ;;
         --validate) cli_validate; exit $? ;;
         --backup) cli_backup; exit $? ;;
