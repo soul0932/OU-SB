@@ -1658,8 +1658,9 @@ EOF
                 pause_screen
                 ;;
             3)
-                install_watchdog
-                ok "保活看门狗已重新安装并启用"
+                setup_services
+                ok "服务加固配置与看门狗已重新应用并启用"
+                service_restart >/dev/null 2>&1 || true
                 pause_screen
                 ;;
             4)
@@ -1999,6 +2000,7 @@ main() {
         --watchdog) run_watchdog; exit $? ;;
         --watchdog-log) show_watchdog_log; exit $? ;;
         --install-watchdog) install_watchdog; exit $? ;;
+        --setup-services|--harden) setup_services; ok "服务配置与看门狗已全部加固更新"; service_restart >/dev/null 2>&1 || true; exit 0 ;;
         --remove-watchdog) uninstall_watchdog; exit $? ;;
         --status) cli_status; exit $? ;;
         --validate) cli_validate; exit $? ;;
