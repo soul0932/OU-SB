@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 APP_NAME="OU-SB"
-APP_VERSION="2.0.0"
+APP_VERSION="2.0.1"
 AUTHOR="nodeseek @cshaizhihao"
 RAW_SCRIPT_URL="${OU_SB_RAW_URL:-https://raw.githubusercontent.com/soul0932/OU-SB/main/OU-SB.sh}"
 
@@ -243,6 +243,15 @@ validate_candidate() {
     sing-box check -c "$candidate" >/dev/null 2>&1
 }
 
+# 廉价结构校验：只起一个 jq 进程，用于每分钟的看门狗健康巡检。
+# 完整的 sing-box check 会拉起一个 Go 进程（128M 小鸡上十几 MB 的瞬时内存），
+# 所以只在配置结构异常、或服务需要重启/回滚时才执行。
+config_structurally_valid() {
+    local candidate=$1
+    [[ -s $candidate ]] || return 1
+    jq -e '.inbounds and .outbounds' "$candidate" >/dev/null 2>&1
+}
+
 detect_memory_mb() {
     local mb=""
     if [[ -r /proc/meminfo ]]; then
@@ -254,22 +263,23 @@ detect_memory_mb() {
     echo "${mb:-1024}"
 }
 
+# 返回 "<GOMEMLIMIT> <GOGC>"。
+# 注意：这里刻意不再下调 GOGC。GOGC 越低 GC 触发越频繁，是用 CPU 换内存，
+# 在 NAT 小鸡上表现为 sing-box 常驻 CPU 明显升高。Go 1.19+ 的正确做法是保留
+# GOGC 默认值（100），只设置 GOMEMLIMIT 作为软上限：堆接近上限时运行时才会
+# 主动加密 GC，既防 OOM 又不牺牲平时的 CPU。
 get_sing_box_mem_limits() {
     local mem_total
     mem_total=$(detect_memory_mb)
     local gomemlimit="" gogc=""
     if ((mem_total <= 128)); then
         gomemlimit="70MiB"
-        gogc="30"
     elif ((mem_total <= 256)); then
         gomemlimit="150MiB"
-        gogc="50"
     elif ((mem_total <= 512)); then
         gomemlimit="320MiB"
-        gogc="60"
     elif ((mem_total <= 1024)); then
         gomemlimit="700MiB"
-        gogc="80"
     fi
     printf '%s %s' "$gomemlimit" "$gogc"
 }
@@ -289,6 +299,19 @@ is_sing_box_process_running() {
     local pid
     pid=$(sing_box_pid)
     [[ -n $pid ]]
+}
+
+# 读取运行中进程真实的 oom_score_adj。
+# 非特权容器（LXC + user namespace）没有宿主命名空间的 CAP_SYS_RESOURCE，
+# 写负值会 EPERM，服务配置里的 --oom-score-adj / OOMScoreAdjust 会静默失效，
+# 所以这里必须读实际值，而不是只相信配置。
+live_oom_score_adj() {
+    local pid adj=""
+    pid=$(sing_box_pid)
+    [[ -n $pid && -r /proc/$pid/oom_score_adj ]] || return 1
+    adj=$(cat "/proc/$pid/oom_score_adj" 2>/dev/null || true)
+    [[ -n $adj ]] || return 1
+    printf '%s' "$adj"
 }
 
 kill_sing_box_process() {
@@ -319,19 +342,62 @@ get_service_status_text() {
     fi
 }
 
+service_in_transition() {
+    # 服务正在启动/停止，或已被监督进程（supervise-daemon）接管重启时不要插手：
+    # 1 核小机上慢启动很常见，插手会与负载叠加，还会把正常的慢启动误判成故障反复重启。
+    if [[ "${OU_SB_TESTING:-0}" == "1" && "${OU_SB_TEST_SERVICE_TRANSITION:-0}" == "1" ]]; then
+        return 0
+    fi
+    local out=""
+    case "$INIT_SYSTEM" in
+        systemd)
+            out=$(systemctl show -p ActiveState --value "$SERVICE_NAME" 2>/dev/null || true)
+            [[ $out == activating || $out == reloading || $out == deactivating ]]
+            ;;
+        openrc)
+            # OpenRC 状态：starting / stopping / inactive / started / crashed / unsupervised
+            out=$(rc-service "$SERVICE_NAME" status 2>&1 || true)
+            [[ $out == *starting* || $out == *stopping* || $out == *crashed* ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+cron_daemon_running() {
+    # 只有 cron 守护进程真的在跑，cron 兜底才算是"已激活"，否则面板会误报绿灯
+    if [[ "${OU_SB_TESTING:-0}" == "1" && -n "${OU_SB_TEST_CRON_RUNNING:-}" ]]; then
+        [[ $OU_SB_TEST_CRON_RUNNING == 1 ]]
+        return
+    fi
+    if [[ $INIT_SYSTEM == systemd ]]; then
+        systemctl is-active --quiet cron 2>/dev/null && return 0
+        systemctl is-active --quiet crond 2>/dev/null && return 0
+    fi
+    if command -v pidof >/dev/null 2>&1; then
+        pidof crond >/dev/null 2>&1 && return 0
+        pidof cron >/dev/null 2>&1 && return 0
+    fi
+    # 注意：不能用 pgrep -x —— Alpine 的 pgrep 是 busybox 符号链接，-x 匹配不到运行中的进程
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep crond >/dev/null 2>&1 && return 0
+        pgrep cron >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
 get_watchdog_status_text() {
     local active=0
     if [[ $INIT_SYSTEM == systemd ]]; then
         systemctl is-active --quiet ou-sb-watchdog.timer 2>/dev/null && active=1
     fi
-    if [[ -f "$CRON_FILE" ]] && grep -q -- "--watchdog" "$CRON_FILE" 2>/dev/null; then
-        active=1
-    fi
-    if [[ -f /etc/crontabs/root ]] && grep -q -- "--watchdog" /etc/crontabs/root 2>/dev/null; then
-        active=1
-    fi
-    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q -- "--watchdog"; then
-        active=1
+    if ((active == 0)) && cron_daemon_running; then
+        if [[ -f "$CRON_FILE" ]] && grep -q -- "--watchdog" "$CRON_FILE" 2>/dev/null; then
+            active=1
+        elif [[ -f /etc/crontabs/root ]] && grep -q -- "--watchdog" /etc/crontabs/root 2>/dev/null; then
+            active=1
+        elif command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q -- "--watchdog"; then
+            active=1
+        fi
     fi
     if ((active == 1)); then
         printf '%s● 已激活 (1分钟自愈巡检)%s' "$C_GREEN" "$C_RESET"
@@ -1320,7 +1386,7 @@ install_sing_box() {
 }
 
 setup_services() {
-    local sb_bin mem_limits gomemlimit gogc env_lines=""
+    local sb_bin gomemlimit gogc env_lines=""
     sb_bin=$(command -v sing-box 2>/dev/null || echo "${OU_SB_SING_BOX_BIN:-/usr/local/bin/sing-box}")
     read -r gomemlimit gogc <<< "$(get_sing_box_mem_limits)"
     if [[ -n $gomemlimit ]]; then
@@ -1337,14 +1403,17 @@ setup_services() {
 Description=sing-box service managed by OU-SB
 After=network-online.target ou-sb-firewall.service
 Wants=network-online.target
-StartLimitIntervalSec=0
+# 保留有限重试（60 秒内 5 次）。彻底关闭限流会在配置错误/端口冲突时形成
+# 每 3 秒一次的 fork/exec 重启风暴，在 NAT 小鸡上直接表现为 CPU 打满。
+# 超过限制后单元进入 failed，由 ou-sb-watchdog 每分钟 reset-failed 后再拉起。
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=$sb_bin run -c $CONFIG_PATH
 Restart=always
 RestartSec=3s
-StartLimitIntervalSec=0
 LimitNOFILE=1048576
 LimitNPROC=512
 OOMScoreAdjust=-500
@@ -1381,7 +1450,7 @@ EOF
 name="sing-box"
 description="sing-box service managed by OU-SB"
 supervisor="supervise-daemon"
-supervise_daemon_args="--respawn-delay-step 2 --respawn-delay-cap 30 --oom-score-adj -900"
+supervise_daemon_args="--respawn-delay-step 2 --respawn-delay-cap 30 --oom-score-adj -500"
 respawn_delay=3
 respawn_max=0
 respawn_period=1800
@@ -1437,7 +1506,7 @@ EOF
 install_watchdog() {
     mkdir -p "$(dirname "$WATCHDOG_LOG")" 2>/dev/null || true
 
-    # 1. systemd 原生定时器与服务
+    # 1. 优先使用 systemd 原生定时器（每分钟巡检）
     if [[ $INIT_SYSTEM == systemd ]]; then
         mkdir -p "$SYSTEMD_DIR"
         cat > "$SYSTEMD_DIR/ou-sb-watchdog.service" <<EOF
@@ -1452,7 +1521,6 @@ EOF
         cat > "$SYSTEMD_DIR/ou-sb-watchdog.timer" <<EOF
 [Unit]
 Description=Run OU-SB Keepalive Watchdog every minute
-PartOf=ou-sb-watchdog.service
 
 [Timer]
 OnBootSec=1m
@@ -1462,13 +1530,24 @@ Unit=ou-sb-watchdog.service
 [Install]
 WantedBy=timers.target
 EOF
+        local timer_ready=0
         if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
             systemctl daemon-reload >/dev/null 2>&1 || true
             systemctl enable --now ou-sb-watchdog.timer >/dev/null 2>&1 || true
+            if systemctl is-active --quiet ou-sb-watchdog.timer 2>/dev/null; then
+                timer_ready=1
+            fi
+        else
+            timer_ready=1
+        fi
+        if ((timer_ready == 1)); then
+            # 单一调度源：清掉历史版本叠加的 cron 任务，避免每分钟被唤醒两次
+            remove_watchdog_cron_entries
+            return 0
         fi
     fi
 
-    # 2. cron 定时任务双重保活
+    # 2. cron 兜底（OpenRC、无 systemd，或定时器启用失败时）
     local cron_dir
     cron_dir="$(dirname "$CRON_FILE")"
     if [[ -d "$cron_dir" ]]; then
@@ -1477,20 +1556,45 @@ EOF
 * * * * * root $COMMAND_PATH --watchdog >/dev/null 2>&1
 EOF
         chmod 644 "$CRON_FILE" 2>/dev/null || true
+        notify_cron_change
     elif [[ -f /etc/crontabs/root ]] || command -v crontab >/dev/null 2>&1; then
         if [[ -d /etc/crontabs ]]; then
             touch /etc/crontabs/root
             if ! grep -q -- "$COMMAND_PATH --watchdog" /etc/crontabs/root 2>/dev/null; then
                 printf '* * * * * %s --watchdog >/dev/null 2>&1\n' "$COMMAND_PATH" >> /etc/crontabs/root
             fi
-            if [[ "${OU_SB_TESTING:-0}" != "1" ]] && command -v rc-service >/dev/null 2>&1; then
-                rc-update add crond default >/dev/null 2>&1 || true
-                rc-service crond start >/dev/null 2>&1 || true
-            fi
+            notify_cron_change
         elif [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
             (crontab -l 2>/dev/null | grep -v -- "$COMMAND_PATH --watchdog" || true; echo "* * * * * $COMMAND_PATH --watchdog >/dev/null 2>&1") | crontab - 2>/dev/null || true
         fi
     fi
+}
+
+# busybox crond（Alpine）只在 /etc/crontabs 目录 mtime 变化时才重新扫描 crontab，
+# 就地追加/删除条目不会生效 —— 实测追加后等 95 秒任务仍未运行，touch 目录后立刻生效。
+# 所以每次改动 cron 条目后都必须 touch 目录，否则看门狗永远不会被调度。
+notify_cron_change() {
+    if [[ -d /etc/crontabs ]]; then
+        touch /etc/crontabs 2>/dev/null || true
+    fi
+    if [[ -d "$(dirname "$CRON_FILE")" ]]; then
+        touch "$(dirname "$CRON_FILE")" 2>/dev/null || true
+    fi
+    if [[ "${OU_SB_TESTING:-0}" != "1" ]] && command -v rc-service >/dev/null 2>&1; then
+        rc-update add crond default >/dev/null 2>&1 || true
+        rc-service crond start >/dev/null 2>&1 || true
+    fi
+}
+
+remove_watchdog_cron_entries() {
+    rm -f "$CRON_FILE" 2>/dev/null || true
+    if [[ -f /etc/crontabs/root ]]; then
+        sed -i "\|$COMMAND_PATH --watchdog|d" /etc/crontabs/root 2>/dev/null || true
+    fi
+    if [[ "${OU_SB_TESTING:-0}" != "1" ]] && command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null | grep -v -- "$COMMAND_PATH --watchdog" || true) | crontab - 2>/dev/null || true
+    fi
+    notify_cron_change
 }
 
 uninstall_watchdog() {
@@ -1501,13 +1605,7 @@ uninstall_watchdog() {
         fi
         rm -f "$SYSTEMD_DIR/ou-sb-watchdog.service" "$SYSTEMD_DIR/ou-sb-watchdog.timer"
     fi
-    rm -f "$CRON_FILE"
-    if [[ -f /etc/crontabs/root ]]; then
-        sed -i "\|$COMMAND_PATH --watchdog|d" /etc/crontabs/root 2>/dev/null || true
-    fi
-    if [[ "${OU_SB_TESTING:-0}" != "1" ]] && command -v crontab >/dev/null 2>&1; then
-        (crontab -l 2>/dev/null | grep -v -- "$COMMAND_PATH --watchdog" || true) | crontab - 2>/dev/null || true
-    fi
+    remove_watchdog_cron_entries
 }
 
 log_watchdog() {
@@ -1525,6 +1623,21 @@ log_watchdog() {
     fi
 }
 
+recover_config_from_backup() {
+    log_watchdog "[ALERT] 当前配置文件校验失败，尝试从最近备份中寻找有效配置恢复..."
+    local b
+    for b in $(ls -t "$BACKUP_DIR"/config[-.]*.json 2>/dev/null || true); do
+        if validate_candidate "$b"; then
+            cp -f "$b" "$CONFIG_PATH"
+            chmod 600 "$CONFIG_PATH"
+            log_watchdog "[OK] 已成功从有效备份 $(basename "$b") 恢复配置"
+            return 0
+        fi
+    done
+    log_watchdog "[ERR] 未找到任何有效配置备份，自愈终止"
+    return 1
+}
+
 run_watchdog() {
     mkdir -p "$(dirname "$WATCHDOG_LOCK")" 2>/dev/null || true
     exec 8>"$WATCHDOG_LOCK" 2>/dev/null || true
@@ -1537,23 +1650,11 @@ run_watchdog() {
         command -v sing-box >/dev/null 2>&1 || return 0
     fi
 
-    # 1. 检查配置损坏情况：若配置文件损坏或为空，但存在有效备份，则先行回滚恢复
-    if ! validate_candidate "$CONFIG_PATH"; then
-        log_watchdog "[ALERT] 当前配置文件校验失败，尝试从最近备份中寻找有效配置恢复..."
-        local restored=1 b
-        for b in $(ls -t "$BACKUP_DIR"/config[-.]*.json 2>/dev/null || true); do
-            if validate_candidate "$b"; then
-                cp -f "$b" "$CONFIG_PATH"
-                chmod 600 "$CONFIG_PATH"
-                log_watchdog "[OK] 已成功从有效备份 $(basename "$b") 恢复配置"
-                restored=0
-                break
-            fi
-        done
-        if ((restored != 0)); then
-            log_watchdog "[ERR] 未找到任何有效配置备份，自愈终止"
-            return 1
-        fi
+    # 1. 廉价结构校验（只起 jq）：捕获配置被截断/非法 JSON 等断电损坏
+    local need_restart=0
+    if ! config_structurally_valid "$CONFIG_PATH"; then
+        recover_config_from_backup || return 1
+        need_restart=1
     fi
 
     # 2. 如果配置正常但没有任何入站协议，则不需要运行服务
@@ -1561,60 +1662,65 @@ run_watchdog() {
     inbound_count=$(jq '.inbounds | length' "$CONFIG_PATH" 2>/dev/null || echo 0)
     ((inbound_count > 0)) || return 0
 
+    # 3. 服务正在启动/停止/被监督进程重启中，本次不插手
+    if service_in_transition; then
+        return 0
+    fi
+
     local is_active=1 has_process=1
     if service_is_active; then is_active=0; fi
-    if pgrep -x sing-box >/dev/null 2>&1; then has_process=0; fi
+    # 用 pidof 优先的探测：Alpine 的 pgrep 是 busybox 符号链接，pgrep -x 匹配不到运行中的 sing-box，
+    # 会造成"进程不存在"的误判并每分钟重启一次服务。
+    if is_sing_box_process_running; then has_process=0; fi
     if [[ "${OU_SB_TESTING:-0}" == "1" && "${OU_SB_TEST_WATCHDOG_DEAD:-0}" != "1" ]]; then
         is_active=0; has_process=0
     fi
 
-    # 健康且正常运行
-    if ((is_active == 0 && has_process == 0)); then
+    # 健康且正常运行：不做完整 sing-box check，直接返回（每分钟省下一个 Go 进程）
+    if ((is_active == 0 && has_process == 0 && need_restart == 0)); then
         return 0
     fi
 
-    log_watchdog "[WARN] 检测到 sing-box 异常 (active=$is_active, process=$has_process)，启动自愈恢复..."
+    # 4. 需要重启/回滚前才做完整校验，避免带着 schema 错误的配置去反复重启
+    if ((need_restart == 0)) && ! validate_candidate "$CONFIG_PATH"; then
+        recover_config_from_backup || return 1
+        need_restart=1
+    fi
 
-    # 2. 清理可能卡死端口的僵尸孤立进程
+    log_watchdog "[WARN] 检测到 sing-box 异常 (active=$is_active, process=$has_process)，启动自愈恢复..."
+    if ((need_restart == 1)); then
+        log_watchdog "[INFO] 配置已从备份回滚，重启服务以加载恢复后的配置"
+    fi
+
+    # 5. 清理可能卡死端口的僵尸孤立进程
     if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
         if ((is_active != 0 && has_process == 0)); then
             log_watchdog "[INFO] 检测到服务停止但进程仍在，清理残留进程以释放端口..."
-            pkill -9 -x sing-box 2>/dev/null || true
+            # killall/pkill -f 在 busybox 上可用；pkill -x 在 busybox 上匹配不到进程
+            kill_sing_box_process
             sleep 1
         fi
         apply_hy2_firewall >/dev/null 2>&1 || true
     fi
 
-    # 3. 通过服务管理器拉起
+    # 6. 通过服务管理器拉起
     if [[ "$INIT_SYSTEM" == "systemd" && "${OU_SB_TESTING:-0}" != "1" ]]; then
         systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
 
     if service_restart >/dev/null 2>&1 || service_start >/dev/null 2>&1; then
         [[ "${OU_SB_TESTING:-0}" != "1" ]] && sleep 1
-        if service_is_active || pgrep -x sing-box >/dev/null 2>&1 || [[ "${OU_SB_TESTING:-0}" == "1" ]]; then
+        if service_is_active || is_sing_box_process_running || [[ "${OU_SB_TESTING:-0}" == "1" ]]; then
             log_watchdog "[OK] 自愈成功：sing-box 服务已成功拉起并恢复运行"
             return 0
         fi
     fi
 
-    # 4. 紧急兜底：直接后台拉起
-    if [[ "${OU_SB_TESTING:-0}" != "1" ]]; then
-        log_watchdog "[WARN] 服务管理器拉起未能就绪，尝试应急后台直接拉起 sing-box..."
-        local sb_bin gomemlimit gogc
-        sb_bin=$(command -v sing-box 2>/dev/null || echo "${OU_SB_SING_BOX_BIN:-/usr/local/bin/sing-box}")
-        read -r gomemlimit gogc <<< "$(get_sing_box_mem_limits)"
-        [[ -n $gomemlimit ]] && export GOMEMLIMIT="$gomemlimit"
-        [[ -n $gogc ]] && export GOGC="$gogc"
-        nohup "$sb_bin" run -c "$CONFIG_PATH" >> /var/log/sing-box.log 2>&1 &
-        sleep 1
-        if pgrep -x sing-box >/dev/null 2>&1; then
-            log_watchdog "[OK] 应急拉起成功：sing-box 进程已恢复"
-            return 0
-        fi
-    fi
-
-    log_watchdog "[ERR] 自愈拉起失败，请使用 sb --doctor 检查错误详情"
+    # 7. 不再绕过服务管理器用 nohup 手动拉起：那样会与 Restart=always 的单元抢端口，
+    #    形成「systemd 每 3 秒重试 + 野进程占住端口」的永久循环，既烧 CPU 又让 systemctl 管不住，
+    #    而且单元里的 GOMEMLIMIT / OOMScoreAdjust 对该进程全部失效。
+    #    这里只记录明确错误，交由服务管理器与下一次巡检继续处理。
+    log_watchdog "[ERR] 服务管理器未能拉起 sing-box，请用 sb --doctor 与 journalctl -u $SERVICE_NAME 排查"
     return 1
 }
 
@@ -1955,14 +2061,23 @@ doctor() {
     local gomemlimit gogc
     read -r gomemlimit gogc <<< "$(get_sing_box_mem_limits)"
     if [[ -n $gomemlimit ]]; then
-        ok "NAT 低内存保护已生效: GOMEMLIMIT=${gomemlimit}, GOGC=${gogc}"
+        ok "NAT 低内存保护已生效: GOMEMLIMIT=${gomemlimit}（GOGC 保持 Go 默认值，避免 GC 频繁触发推高 CPU）"
     else
-        info "内存较充裕 (>512MB)，使用标准垃圾回收"
+        info "内存较充裕 (>1024MB)，使用标准垃圾回收"
     fi
     if service_is_active; then
         ok "sing-box 服务正在运行"
     else
         warn "sing-box 服务未处于运行状态"
+    fi
+    local live_adj
+    if live_adj=$(live_oom_score_adj); then
+        if ((live_adj < 0)); then
+            ok "OOM 优先级保护已生效: oom_score_adj=${live_adj}"
+        else
+            warn "oom_score_adj=${live_adj}，负值保护未生效：本容器不允许写负 oom_score_adj（需要宿主命名空间的 CAP_SYS_RESOURCE）"
+            info "  → sing-box 不会获得 OOM 优先级保护，请依赖 GOMEMLIMIT，并避免在低内存小鸡上跑 IP 体检/测速类重负载脚本"
+        fi
     fi
     ok "保活看门狗配置状态: $(get_watchdog_status_text)"
 }
@@ -1976,6 +2091,8 @@ $APP_NAME $APP_VERSION
   sb --clear-firewall    清理 OU-SB 的 HY2 跳跃规则
   sb --watchdog          执行保活看门狗健康巡检与自愈
   sb --watchdog-log      查看保活看门狗自愈日志
+  sb --setup-services    重新应用服务加固配置与看门狗（升级后推荐）
+  sb --remove-watchdog   停止并卸载保活看门狗
   sb --status            查看系统、服务和协议状态
   sb --validate          校验配置和状态文件
   sb --backup            创建配置备份
@@ -1989,19 +2106,43 @@ main() {
     init_colors
     detect_platform
     require_root
+
+    # 关键：保活类子命令必须在 ensure_base_config 与 acquire_lock 之前分发，而且不能触发依赖安装。
+    # 否则会出现三个问题：
+    #   1) 配置损坏时 ensure_base_config 会先 die，--watchdog 永远走不到回滚自愈逻辑；
+    #   2) 管理面板一直持有 ou-sb.lock，看门狗每分钟都会被 flock 拒绝而静默失效；
+    #   3) 每分钟一次的巡检若因缺依赖去跑 apt/apk，会把小鸡 CPU 直接打满。
+    case "${1:-}" in
+        --watchdog)
+            prepare_directories
+            init_state
+            run_watchdog
+            exit $?
+            ;;
+        --watchdog-log) show_watchdog_log; exit $? ;;
+        --remove-watchdog) uninstall_watchdog; exit $? ;;
+    esac
+
     install_dependencies
     prepare_directories
-    acquire_lock
     init_state
-    ensure_base_config
+
+    # 保活/加固类命令在配置损坏时也必须可用，因此同样放在 ensure_base_config 与 acquire_lock 之前
     case "${1:-}" in
+        --install-watchdog) install_watchdog; exit $? ;;
+        --setup-services|--harden)
+            setup_services
+            ok "服务配置与看门狗已全部加固更新"
+            service_restart >/dev/null 2>&1 || true
+            exit 0
+            ;;
         --apply-firewall) apply_hy2_firewall; exit $? ;;
         --clear-firewall) clear_hy2_firewall; exit $? ;;
-        --watchdog) run_watchdog; exit $? ;;
-        --watchdog-log) show_watchdog_log; exit $? ;;
-        --install-watchdog) install_watchdog; exit $? ;;
-        --setup-services|--harden) setup_services; ok "服务配置与看门狗已全部加固更新"; service_restart >/dev/null 2>&1 || true; exit 0 ;;
-        --remove-watchdog) uninstall_watchdog; exit $? ;;
+    esac
+
+    acquire_lock
+    ensure_base_config
+    case "${1:-}" in
         --status) cli_status; exit $? ;;
         --validate) cli_validate; exit $? ;;
         --backup) cli_backup; exit $? ;;

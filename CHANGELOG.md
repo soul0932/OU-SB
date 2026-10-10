@@ -4,17 +4,46 @@
 
 ### Added
 - **NAT 小鸡高可用加固**：
-  - Systemd 服务配置 `Restart=always`、`StartLimitIntervalSec=0` 与 `OOMScoreAdjust=-500`，彻底关闭崩溃限流，服务死掉后无条件自动重启。
+  - Systemd 服务配置 `Restart=always`、有限重启限流（`StartLimitIntervalSec=60` + `StartLimitBurst=5`）与 `OOMScoreAdjust=-500`；触发限流后单元进入 failed，由看门狗每分钟 `reset-failed` 再拉起，兼顾"永不放弃"与"不烧 CPU"。
   - OpenRC 服务配置 `supervisor="supervise-daemon"` 与 `respawn_delay=3`，解决 Alpine Linux 下服务挂掉无法自愈的缺陷。
-  - 针对 NAT 超低内存小鸡（<=512MB）阶梯化动态注入 Go 内存控制（`GOMEMLIMIT` 与 `GOGC`），防止内存膨胀触发 OOM Killer 强杀。
-  - 增加双重看门狗（Systemd Timer + Cron 联动）每分钟健康巡检；支持进程崩溃自愈、孤立僵死进程清理、损坏配置从备份自动回滚与自愈日志记录。
+  - 针对 NAT 超低内存小鸡（<=1GB）阶梯化动态注入 `GOMEMLIMIT` 软内存上限，防止内存膨胀触发 OOM Killer 强杀；不再下调 `GOGC`，避免 GC 频繁触发推高常驻 CPU。
+  - 增加看门狗每分钟健康巡检（Systemd Timer 优先，OpenRC/无 systemd 时回退 Cron，单一调度源不重复唤醒）；支持进程崩溃自愈、孤立僵死进程清理、损坏配置从备份自动回滚（回滚后自动重启以加载恢复的配置）与自愈日志记录。
 - **CLI 与管理面板**：
   - 管理面板顶部实时展示服务运行状态与保活看门狗激活状态。
   - 新增管理菜单选项 `11) 保活看门狗管理（自动拉起/自愈日志）`。
-  - 新增命令行选项 `sb --watchdog` 与 `sb --watchdog-log`。
+  - 新增命令行选项 `sb --watchdog`、`sb --watchdog-log`、`sb --install-watchdog`、`sb --remove-watchdog` 与 `sb --setup-services`（别名 `--harden`）。
   - `sb --doctor` 新增内存阶梯检测与看门狗健康诊断。
 - **测试套件扩展**：
   - 单元测试覆盖低内存分级限额、Systemd/OpenRC 模板生成、看门狗损坏配置自愈回滚与任务卸载。
+  - 新增 `main()` 入口回归测试：非法 JSON / 被截断的配置下 `sb --watchdog` 仍能完成回滚与重启（此前会被预检 `ensure_base_config` 提前 `die`）。
+  - 新增重启限流、GOGC 不再被覆盖、Timer 模式下 cron 去重的断言。
+
+### Changed
+- 看门狗健康巡检改为廉价路径：服务正常时只用 `jq` 做配置结构检查，仅在结构异常、或需要重启/回滚时才执行完整的 `sing-box check`，避免在 128M 小鸡上每分钟多拉起一个 Go 进程抢内存。
+- 服务处于 `starting` / `stopping` / `crashed`（OpenRC supervise-daemon）或 `activating` / `reloading`（systemd）时，看门狗主动让路，不再与 1 核小机上的慢启动互相叠加。
+- OpenRC 的 `--oom-score-adj` 由 `-900` 调整为 `-500`，与 systemd 对齐，避免宿主机 OOM killer 转而去杀其它进程。
+- 看门狗状态显示要求 cron 守护进程确实在运行，避免 cron 未启动时面板误报「已激活」。
+- 已在 Alpine 3.23 / OpenRC 0.63 实机核对 `supervise-daemon` 参数：`--respawn-delay-step`、`--respawn-delay-cap`、`--oom-score-adj` 均受支持，且 `output_log` / `error_log` 会被 OpenRC 自动映射为 `--stdout` / `--stderr`，切到 supervise-daemon 后日志不会丢。
+- README 新增「128M 超低内存小鸡注意事项」，说明跑 IP 质量体检/测速脚本时的资源占用与排查方式。
+
+### Verified
+- 在 Alpine 3.23 / OpenRC 0.63 / 122MB 无 swap 容器上实机验证「被 OOM 杀掉后自动拉活」：
+  - `kill -9`（等价 OOM killer）sing-box 后约 **5 秒**由 `supervise-daemon` 拉起；连续 3 次击杀每次都恢复（`rc-status` 重生计数累加到 3）。
+  - `respawn_max=0` 确认为**不限次数**：探针服务（永远启动失败）在 80 秒内被重启 18 次仍在继续，因此内存压力缓解后必然自动恢复。
+  - 连 `supervise-daemon` 一起击杀时，服务变为 `unsupervised`，cron 看门狗在 1 分钟内清理残留进程并重建监督（日志含 WARN/INFO/OK 三行）。
+  - 故意写坏配置文件后，cron 看门狗在下一个整分钟从备份回滚并重启服务，无需人工介入。
+
+### Fixed
+- 修复 Alpine/busybox 下**看门狗从未被执行**的问题：busybox crond 只在 `/etc/crontabs` **目录 mtime** 变化时才重新扫描 crontab，就地追加/删除条目不会生效（实测追加后等 95 秒任务仍未运行，`touch` 目录后立刻生效）。现在写入或删除 cron 条目后都会 touch 目录，并确保 crond 已启用运行。
+- 修复 busybox 环境（Alpine）下 `pgrep -x` 匹配不到运行中的进程：看门狗会把正常的 sing-box 误判为「进程已死」并**每分钟重启一次服务**。进程存活判定改为 pidof 优先，清理残留进程改用 killall / `pkill -f`（busybox 的 `pkill -x` 同样不可靠）。
+- `sb --doctor` 现在读取运行中进程真实的 `oom_score_adj`：非特权 LXC 容器没有宿主命名空间的 `CAP_SYS_RESOURCE`，写负值会 EPERM，配置里的 `--oom-score-adj` / `OOMScoreAdjust` 会静默失效；doctor 会如实提示，而不是假报「已保护」。
+- 修复配置损坏时自愈完全失效：`--watchdog` 等保活/加固类子命令改为在 `ensure_base_config` 与 `acquire_lock` 之前分发，非法 JSON 配置不再导致看门狗 `die`，被截断的配置也不再被静默覆盖成空配置。
+- 修复看门狗回滚备份后不重启服务、恢复的配置不生效的问题。
+- 移除看门狗绕过服务管理器的 `nohup` 应急兜底：该兜底会与 `Restart=always` 的单元抢端口，形成永久重启循环，并让 `systemctl` 无法管理该进程。
+- 修复管理面板持有 `ou-sb.lock` 期间看门狗每分钟被拒绝、保活静默失效的问题。
+- 修复 Systemd Timer 与 Cron 双重调度导致的每分钟重复巡检。
+- 移除 `[Service]` 段中无效的 `StartLimitIntervalSec` 重复项（该指令属于 `[Unit]`）。
+- 版本号与 CHANGELOG 对齐为 `2.0.1`。
 
 ## V2.0.0 - 2026-10-08
 
