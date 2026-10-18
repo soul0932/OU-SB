@@ -124,10 +124,78 @@ prepare_directories() {
     chmod 700 "$APP_DIR" "$BACKUP_DIR" "$CERT_DIR"
 }
 
+# flock 的锁属于"打开的文件实例"，fork/exec 出去的子进程会继承同一个实例，
+# 所以重开 fd 必须在外层做，不能放在可能在管道/子 shell 里执行的函数中。
+obtain_lock_fd() {
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if exec 9>"$LOCK_PATH" && flock -n 9; then
+            return 0
+        fi
+        exec 9>&-
+        ((attempt < 10)) && sleep 0.2
+    done
+    return 1
+}
+
+# 判断进程是否还活着（僵尸不算），用于区分"真正的并发 sb"与"已被挂死但锁仍挂在继承 fd 上的旧实例"。
+process_is_alive() {
+    local pid=$1 state=""
+    [[ $pid =~ ^[0-9]+$ ]] || return 1
+    if [[ -r /proc/$pid/stat ]]; then
+        state=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+        state=${state##*) }
+        state=${state%% *}
+        [[ $state != Z && $state != X ]]
+        return
+    fi
+    kill -0 "$pid" 2>/dev/null
+}
+
+# 找出持有锁文件的进程。用 /proc 扫描而不是 `lsof -t`：Alpine 上的 lsof 输出会带列标题，
+# 在脚本里容易把 "COMMAND PID ..." 这类文本当成 PID。
+lock_holder_pid() {
+    local dir fd pid holder=""
+    [[ -d /proc ]] || return 0
+    for dir in /proc/[0-9]*; do
+        pid=${dir#/proc/}
+        [[ $pid == "$$" || $pid == "$BASHPID" ]] && continue
+        for fd in "$dir"/fd/*; do
+            if [[ $(readlink "$fd" 2>/dev/null) == "$LOCK_PATH" ]]; then
+                holder=$pid
+                break 2
+            fi
+        done
+    done
+    printf '%s' "$holder"
+}
+
+# 测试可注入一个假的持有者，避免依赖 /proc（macOS 上没有）。
+lock_holder_probe() {
+    if [[ -n "${OU_SB_TEST_LOCK_HOLDER:-}" ]]; then
+        printf '%s' "$OU_SB_TEST_LOCK_HOLDER"
+        return 0
+    fi
+    lock_holder_pid
+}
+
 acquire_lock() {
     command -v flock >/dev/null 2>&1 || die "未找到 flock"
-    exec 9>"$LOCK_PATH"
-    flock -n 9 || die "另一个 OU-SB 操作正在运行"
+    obtain_lock_fd && return 0
+
+    # 锁被占着：老版本脚本与未加 --close-fds 的 rc-service 会把锁 fd 泄漏给 sing-box / supervise-daemon；
+    # SSH 断开时面板进程也可能被 SIGHUP 挂死并继续占着锁。只要占锁进程已死，就清掉它再重试。
+    local holder
+    holder=$(lock_holder_probe)
+    if [[ -n $holder ]] && ! process_is_alive "$holder"; then
+        info "清理已退出的 OU-SB 残留进程（PID $holder）占用的锁"
+        kill -9 "$holder" 2>/dev/null || true
+        sleep 0.2
+    fi
+    if obtain_lock_fd; then
+        return 0
+    fi
+    die "另一个 OU-SB 操作正在运行（占用进程 PID ${holder:-未知}）"
 }
 
 init_state() {
@@ -413,7 +481,7 @@ service_restart() {
             systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
             systemctl restart "$SERVICE_NAME"
             ;;
-        openrc) rc-service "$SERVICE_NAME" restart ;;
+        openrc) rc-service --close-fds "$SERVICE_NAME" restart ;;
         *) return 1 ;;
     esac
 }
@@ -425,7 +493,7 @@ service_start() {
             systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
             systemctl start "$SERVICE_NAME"
             ;;
-        openrc) rc-service "$SERVICE_NAME" start ;;
+        openrc) rc-service --close-fds "$SERVICE_NAME" start ;;
         *) return 1 ;;
     esac
 }

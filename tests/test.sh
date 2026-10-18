@@ -299,5 +299,55 @@ assert_false "watchdog service removed" test -f "$SYSTEMD_DIR/ou-sb-watchdog.ser
 assert_false "watchdog timer removed" test -f "$SYSTEMD_DIR/ou-sb-watchdog.timer"
 assert_false "watchdog cron entry removed" test -f "$CRON_FILE"
 
+# 11. 锁冲突时的自愈与提示逻辑。
+#     macOS 上的 flock 是 Homebrew 的 perl 实现，跨进程阻塞语义与内核 flock 不一致，
+#     所以这里用桩函数验证判定分支；真实的锁互斥在 Linux 测试机上验证。
+lock_file="$TEST_ROOT/lock-fixture.lock"
+: > "$lock_file"
+LOCK_PATH="$lock_file"
+
+assert_eq "dead pid is detected as dead" "dead" \
+    "$(process_is_alive 999999 && printf alive || printf dead)"
+assert_eq "own pid is detected as alive" "alive" \
+    "$(process_is_alive $$ && printf alive || printf dead)"
+
+# 拿锁失败 + 占用者已死：先清理并重试，第二次成功
+(
+    lock_attempts=0
+    obtain_lock_fd() {
+        lock_attempts=$((lock_attempts + 1))
+        ((lock_attempts >= 2))
+    }
+    lock_holder_probe() { printf 999999; }
+    cleaned_pid=""
+    kill() { cleaned_pid=$2; }
+    acquire_lock
+    printf '%s|%s\n' "$cleaned_pid" "$lock_attempts" > "$TEST_ROOT/dead.result"
+) 2>/dev/null
+IFS='|' read -r cleaned attempts < "$TEST_ROOT/dead.result"
+assert_eq "stale holder is killed before retrying" "999999" "$cleaned"
+assert_eq "lock is acquired after cleaning the stale holder" "2" "$attempts"
+
+# 拿锁失败 + 占用者还活着：不能杀，提示里必须带 PID
+live_out=$(
+    (
+        obtain_lock_fd() { return 1; }
+        lock_holder_probe() { printf 4242; }
+        # 只有 kill -9 才算清理动作：活着的占用者绝不能被杀
+        kill() {
+            # kill -0 是存活探测，不属于清理动作
+            [[ $1 == -9 ]] && : > "$TEST_ROOT/killed"
+            return 0
+        }
+        acquire_lock
+        printf 'ACQUIRED\n'
+    ) 2>&1
+) || true
+assert_false "live holder is never killed" test -f "$TEST_ROOT/killed"
+assert_false "lock is not acquired while a live sb holds it" grep -q "ACQUIRED" <<< "$live_out"
+assert_true "lock error names the holding PID" grep -q "占用进程 PID 4242" <<< "$live_out"
+
+LOCK_PATH="$APP_DIR/ou-sb.lock"
+
 printf '\n%d passed, %d failed\n' "$passes" "$failures"
 ((failures == 0))

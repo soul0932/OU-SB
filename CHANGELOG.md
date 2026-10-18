@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- 修复修改端口 / 启停服务后 `sb` 持续报「另一个 OU-SB 操作正在运行」的问题。根因是锁 fd 泄漏：
+  `acquire_lock` 用 `exec 9>` 打开 `ou-sb.lock`，而 OpenRC 的 `rc-service` 默认把非 CLOEXEC 的 fd 继承给它拉起的进程，
+  `supervise-daemon` 因此长期持有这把锁；面板退出后锁不会释放，之后所有 `sb` 调用都失败，直到 sing-box 被重启。
+  - `rc-service` 调用（restart / start）统一加上 `--close-fds`，不再把锁传给守护进程。
+  - `acquire_lock` 改为带重试的 `obtain_lock_fd`；失败时通过 `/proc` 扫描定位真正持有锁的进程：
+    占锁进程已退出（如 SSH 断开后被挂住的面板）则自动清理并重试，仍存活则拒绝运行并提示占用者 PID，
+    避免「有残留锁却无法操作」和「为了解锁误杀正常服务进程」两种问题。
+- 新增锁冲突回归测试：死进程自动清理、活进程拒绝并带 PID、不误杀活着的占用者。
+
 ## V2.0.1 - 2026-10-10
 
 ### Added
