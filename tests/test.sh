@@ -351,14 +351,19 @@ assert_true "lock error names the holding PID" grep -q "占用进程 PID 4242" <
 assert_false "no bogus rc-service --close-fds flag" \
     grep -q -- 'rc-service --close-fds' "$PROJECT_DIR/OU-SB.sh"
 
-# 启动服务时不能把锁 fd 交给子进程（否则 supervise-daemon 会一直占着锁）
-if exec 9>"$TEST_ROOT/fd-close.lock"; then
-    leak=$(
-        run_without_extra_fds bash -c 'ls /proc/$$/fd 2>/dev/null | grep -qx 9 && echo LEAK || echo CLEAN'
-    )
-    assert_eq "service start helper closes inherited lock fd" "CLEAN" "$leak"
-    exec 9>&-
-fi
+# 启动服务时不能把锁 fd 交给子进程（否则 supervise-daemon 会一直占着锁）。
+# 子进程里用它自己的 $$ 判定，不依赖 /proc（macOS 上没有）。
+fd_lock="$TEST_ROOT/fd-close.lock"
+exec 9>"$fd_lock"
+leak=$(
+    bash -c 'test -e /proc/$$/fd/9 && echo LEAK || (lsof -p $$ 2>/dev/null | grep -q fd-close.lock && echo LEAK || echo CLEAN)'
+)
+wrapped=$(
+    run_without_extra_fds bash -c 'test -e /proc/$$/fd/9 && echo LEAK || (lsof -p $$ 2>/dev/null | grep -q fd-close.lock && echo LEAK || echo CLEAN)'
+)
+exec 9>&-
+assert_eq "plain exec inherits the lock fd (sanity)" "LEAK" "$leak"
+assert_eq "service start helper closes inherited lock fd" "CLEAN" "$wrapped"
 
 LOCK_PATH="$APP_DIR/ou-sb.lock"
 

@@ -481,11 +481,18 @@ get_watchdog_status_text() {
 # 直接传会被 rc-service 判为未知选项而失败。
 run_without_extra_fds() {
     (
-        local fd
-        for fd in /proc/$$/fd/* /dev/fd/*; do
-            fd=${fd##*/}
+        local fd fds
+        # 1) 必须用 /proc/self：子 shell 里 $$ 仍是父进程 PID，照 $$ 遍历会拿到父进程的 fd 表，
+        #    子进程自己的 fd 反而关不掉，锁照样泄漏给 supervise-daemon。
+        # 2) 先读完 fd 列表再关：边遍历边关会让目录流自身失效，后面的 fd 会被漏掉。
+        fds=$(ls /proc/self/fd 2>/dev/null) || fds=$(ls /dev/fd 2>/dev/null) || fds=""
+        # 极端精简系统两者都没有时直接执行，宁可冒险继承 fd 也不能让服务起不来
+        [[ -n $fds ]] || exec "$@"
+        for fd in $fds; do
             [[ $fd =~ ^[0-9]+$ ]] || continue
-            ((fd > 2)) && eval "exec $fd>&-" 2>/dev/null
+            if ((fd > 2)); then
+                eval "exec $fd>&-" 2>/dev/null || true
+            fi
         done
         exec "$@"
     )
@@ -496,7 +503,7 @@ service_restart() {
     case "$INIT_SYSTEM" in
         systemd)
             systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
-            systemctl restart "$SERVICE_NAME"
+            run_without_extra_fds systemctl restart "$SERVICE_NAME"
             ;;
         openrc) run_without_extra_fds rc-service "$SERVICE_NAME" restart ;;
         *) return 1 ;;
@@ -508,7 +515,7 @@ service_start() {
     case "$INIT_SYSTEM" in
         systemd)
             systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
-            systemctl start "$SERVICE_NAME"
+            run_without_extra_fds systemctl start "$SERVICE_NAME"
             ;;
         openrc) run_without_extra_fds rc-service "$SERVICE_NAME" start ;;
         *) return 1 ;;

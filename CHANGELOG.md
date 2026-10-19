@@ -6,9 +6,11 @@
 - 修复修改端口 / 启停服务后 `sb` 持续报「另一个 OU-SB 操作正在运行」的问题。根因是锁 fd 泄漏：
   `acquire_lock` 用 `exec 9>` 打开 `ou-sb.lock`，而 OpenRC 的 `rc-service` 默认把非 CLOEXEC 的 fd 继承给它拉起的进程，
   `supervise-daemon` 因此长期持有这把锁；面板退出后锁不会释放，之后所有 `sb` 调用都失败，直到 sing-box 被重启。
-  - `rc-service` 的 restart / start 改为经 `run_without_extra_fds` 调用：在子 shell 里关闭所有非标准 fd 后
-    再 exec，锁 fd 不会再被继承给 `supervise-daemon`。（`rc-service` 本身**没有** `--close-fds` 选项，
-    那是 `start-stop-daemon` 的参数，上一版误加会导致 OpenRC 上所有重启失败。）
+  - 服务的 restart / start（OpenRC 的 `rc-service`、systemd 的 `systemctl`）统一经 `run_without_extra_fds`
+    调用：在子 shell 里关闭所有非标准 fd 后再 exec，锁 fd 不会再被继承给 `supervise-daemon`。
+    （`rc-service` 本身**没有** `--close-fds` 选项，那是 `start-stop-daemon` 的参数，误用会导致 OpenRC 上重启全部失败。）
+  - `run_without_extra_fds` 用 `/proc/self/fd` 定位自身 fd（子 shell 里 `$$` 仍是父 PID，会错误地拿到父进程 fd 表），
+    并且先读完 fd 列表再逐个关闭（边遍历边关会让目录流失效而漏掉 fd）。
   - `acquire_lock` 改为带重试的 `obtain_lock_fd`；失败时通过 `/proc` 扫描定位真正持有锁的进程：
     占锁进程已退出（如 SSH 断开后被挂住的面板）则自动清理并重试，仍存活则拒绝运行并提示占用者 PID，
     避免「有残留锁却无法操作」和「为了解锁误杀正常服务进程」两种问题。
