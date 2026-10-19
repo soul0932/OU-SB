@@ -183,7 +183,7 @@ acquire_lock() {
     command -v flock >/dev/null 2>&1 || die "未找到 flock"
     obtain_lock_fd && return 0
 
-    # 锁被占着：老版本脚本与未加 --close-fds 的 rc-service 会把锁 fd 泄漏给 sing-box / supervise-daemon；
+    # 锁被占着：老版本脚本会把锁 fd 泄漏给 supervise-daemon（rc-service 会继承非 CLOEXEC 的 fd）；
     # SSH 断开时面板进程也可能被 SIGHUP 挂死并继续占着锁。只要占锁进程已死，就清掉它再重试。
     local holder
     holder=$(lock_holder_probe)
@@ -474,6 +474,23 @@ get_watchdog_status_text() {
     fi
 }
 
+# 关闭除标准输入输出外的所有 fd，再 exec 目标命令。
+# 目的：不要把 ou-sb.lock 的锁 fd 交给 rc-service —— OpenRC 会把它继承给 supervise-daemon，
+# 锁于是被守护进程长期占用，之后所有 sb 都报"另一个 OU-SB 操作正在运行"。
+# 注意 rc-service 本身没有 --close-fds（那是 start-stop-daemon 的参数），
+# 直接传会被 rc-service 判为未知选项而失败。
+run_without_extra_fds() {
+    (
+        local fd
+        for fd in /proc/$$/fd/* /dev/fd/*; do
+            fd=${fd##*/}
+            [[ $fd =~ ^[0-9]+$ ]] || continue
+            ((fd > 2)) && eval "exec $fd>&-" 2>/dev/null
+        done
+        exec "$@"
+    )
+}
+
 service_restart() {
     [[ "${OU_SB_TESTING:-0}" == "1" ]] && return 0
     case "$INIT_SYSTEM" in
@@ -481,7 +498,7 @@ service_restart() {
             systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
             systemctl restart "$SERVICE_NAME"
             ;;
-        openrc) rc-service --close-fds "$SERVICE_NAME" restart ;;
+        openrc) run_without_extra_fds rc-service "$SERVICE_NAME" restart ;;
         *) return 1 ;;
     esac
 }
@@ -493,7 +510,7 @@ service_start() {
             systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
             systemctl start "$SERVICE_NAME"
             ;;
-        openrc) rc-service --close-fds "$SERVICE_NAME" start ;;
+        openrc) run_without_extra_fds rc-service "$SERVICE_NAME" start ;;
         *) return 1 ;;
     esac
 }

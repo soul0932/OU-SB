@@ -347,6 +347,19 @@ assert_false "live holder is never killed" test -f "$TEST_ROOT/killed"
 assert_false "lock is not acquired while a live sb holds it" grep -q "ACQUIRED" <<< "$live_out"
 assert_true "lock error names the holding PID" grep -q "占用进程 PID 4242" <<< "$live_out"
 
+# 12. rc-service 没有 --close-fds（那是 start-stop-daemon 的参数），传了会被判为未知选项
+assert_false "no bogus rc-service --close-fds flag" \
+    grep -q -- 'rc-service --close-fds' "$PROJECT_DIR/OU-SB.sh"
+
+# 启动服务时不能把锁 fd 交给子进程（否则 supervise-daemon 会一直占着锁）
+if exec 9>"$TEST_ROOT/fd-close.lock"; then
+    leak=$(
+        run_without_extra_fds bash -c 'ls /proc/$$/fd 2>/dev/null | grep -qx 9 && echo LEAK || echo CLEAN'
+    )
+    assert_eq "service start helper closes inherited lock fd" "CLEAN" "$leak"
+    exec 9>&-
+fi
+
 LOCK_PATH="$APP_DIR/ou-sb.lock"
 
 printf '\n%d passed, %d failed\n' "$passes" "$failures"
